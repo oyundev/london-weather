@@ -1,0 +1,221 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"name":"csharp"}]}}
+
+#!csharp
+
+// london_weather.csv : https://www.kaggle.com/datasets/emmanuelfwerr/london-weather-data
+// Install the Microsoft.ML packages we're going to use for ML.NET
+#r "nuget:Microsoft.ML"
+#r "nuget:Microsoft.Data.Analysis"
+#r "nuget:Microsoft.ML.TimeSeries"
+
+#!csharp
+
+using Microsoft.ML;
+using Microsoft.ML.Data;
+
+#!csharp
+
+public class WeatherInput
+{
+    [LoadColumn(0)]
+    public DateTime WeatherDate; // Date: yyyyMMdd
+    [LoadColumn(1)]
+    public float CloudCover; // in oktas
+    [LoadColumn(2)]
+    public float Sunshine; // in hours
+    [LoadColumn(3)]
+    public float GlobalRads; // Global radiation in Watt / square meter
+    [LoadColumn(4)]
+    public float MaxTemp; // Celsius
+    [LoadColumn(5)]
+    public float MeanTemp; // Celsius
+    [LoadColumn(6)]
+    public float MinTemp; // Celsius
+    [LoadColumn(7)]
+    public float Precipitation; // This is the precipitation in millimeters.
+    [LoadColumn(8)]
+    public float Pressure; // In Pascals. This is what we want to predict.
+    // Ignore snow depth since that won't be known at time of prediction and is related to Precipitatio
+}
+
+#!csharp
+
+// Create an ML Context. We'll use this for all ML operations
+var context = new MLContext(seed: 2024);
+
+#!csharp
+
+// Load the data
+var data = context.Data
+.LoadFromTextFile<WeatherInput>("london_weather.csv"
+, separatorChar: ','
+, hasHeader: true
+, allowQuoting: true);
+
+#!csharp
+
+// View schema
+data.Schema
+
+#!csharp
+
+// Preview data
+data.Preview(3).RowView
+
+#!csharp
+
+using Microsoft.Data.Analysis;
+var df = data.ToDataFrame();
+
+#!csharp
+
+df.Head(5)
+
+#!csharp
+
+df.Info()
+
+#!csharp
+
+df.Description()
+
+#!csharp
+
+// Split into train and test splits to detect overfitting
+var split = context.Data.TrainTestSplit(data, testFraction: 0.2);
+
+#!csharp
+
+var testSet = split.TestSet; // 20 % of the data (0.2)
+
+#!csharp
+
+var trainSet = split.TrainSet; // 80 % of the data (0.8)
+
+#!csharp
+
+var featureArray = new string[] {"CloudCover","Sunshine","GlobalRads","MaxTemp","MeanTemp","MinTemp","Pressure"};
+
+#!csharp
+
+var processPipeline = context.Transforms.CopyColumns("Label", "Pressure")
+    .Append(context.Transforms.NormalizeMeanVariance("CloudCover", "CloudCover"))
+    .Append(context.Transforms.NormalizeMeanVariance("Sunshine", "Sunshine"))
+    .Append(context.Transforms.NormalizeMeanVariance("GlobalRads", "GlobalRads"))
+    .Append(context.Transforms.NormalizeMeanVariance("MaxTemp", "MaxTemp"))
+    .Append(context.Transforms.NormalizeMeanVariance("MeanTemp", "MeanTemp"))
+    .Append(context.Transforms.NormalizeMeanVariance("MinTemp", "MinTemp"))
+    .Append(context.Transforms.NormalizeMeanVariance("Precipitation", "Precipitation"))
+    .Append(context.Transforms.Concatenate("Features", featureArray))
+    .AppendCacheCheckpoint(context);
+
+#!csharp
+
+// Some of the available options with the base ML.NET package are: https://learn.microsoft.com/en-us/dotnet/api/microsoft.ml.trainers?view=ml-dotnet
+//  * LbfgsPoissonRegression
+//  * OnlineGradientDescent
+//  * Sdca
+// Select the algorithm we want
+var trainer = context.Regression.Trainers.OnlineGradientDescent(labelColumnName: "Label", featureColumnName: "Features");
+
+#!csharp
+
+// Generate a training pipeline based on the processing pipeline mixed with the trainer
+var trainingPipeline = processPipeline.Append(trainer);
+
+#!csharp
+
+// Train the model
+var model = trainingPipeline.Fit(trainSet);
+
+#!csharp
+
+var testResults = model.Transform(testSet);
+var testMetrics = context.Regression.Evaluate(testResults, "Label", "Score");
+testMetrics
+
+#!csharp
+
+// Saving the Model
+// context.Model.Save(model, data.Schema, "Model.zip")
+// Loading the Model
+// var (loadedModel, loadedSchema) = context.Model.Load("Model.zip");
+
+#!csharp
+
+public class WeatherPrediction
+{
+    [ColumnName("Score")]
+    public float Pressure; //This is what we want to predict.
+}
+
+#!csharp
+
+var predictionEngine = context.Model.CreatePredictionEngine<WeatherInput, WeatherPrediction>(model);
+
+#!csharp
+
+var conditions = new WeatherInput {
+    WeatherDate = DateTime.Now,
+    CloudCover = 4f,
+    Sunshine = 5.8f,
+    GlobalRads = 50f,
+    MaxTemp = 5.2f,
+    MinTemp = 1.6f,
+    MeanTemp = 3.7f,
+    Precipitation = 4.0f,
+    Pressure = 0f, // Needed for the compiler, but its value is ignored.
+};
+
+#!csharp
+
+var prediction = predictionEngine.Predict(conditions);
+
+#!csharp
+
+prediction
+
+#!csharp
+
+public class WeatherInputTimeSeriesForecastedPrediction
+{
+    public float[] ForecastedPressure { get; set; }
+    public float[] ConfidenceLowerBound { get; set; }
+    public float[] ConfidenceUpperBound { get; set; }
+}
+
+#!csharp
+
+using Microsoft.ML.Transforms.TimeSeries;
+
+#!csharp
+
+var length = (int)trainSet.ToDataFrame().Rows.Count;
+var forecastEstimator = context.Forecasting.ForecastBySsa(
+    outputColumnName: nameof(WeatherInputTimeSeriesForecastedPrediction.ForecastedPressure),
+    inputColumnName: nameof(WeatherInput.Pressure),
+    windowSize: 12,
+    seriesLength: length,
+    trainSize: length,
+    horizon: 4,
+    confidenceLevel: 0.95f,
+    confidenceLowerBoundColumn: nameof(WeatherInputTimeSeriesForecastedPrediction.ConfidenceLowerBound),
+    confidenceUpperBoundColumn: nameof(WeatherInputTimeSeriesForecastedPrediction.ConfidenceUpperBound));
+
+#!csharp
+
+var forecastTransformerModel = forecastEstimator.Fit(trainSet);
+
+#!csharp
+
+var forecastingEngine = forecastTransformerModel.CreateTimeSeriesEngine<WeatherInput, WeatherInputTimeSeriesForecastedPrediction>(context);
+
+#!csharp
+
+var forecasts = forecastingEngine.Predict();
+
+#!csharp
+
+forecasts.Display()
